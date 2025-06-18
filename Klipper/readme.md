@@ -110,13 +110,13 @@ See the supplied `filament_runout_wifi.cfg` for details.
 - If Klipper doesn't pause, check your ESP8266's WiFi and Moonraker URL/API key.
 - Use the serial monitor for debug output.
 - Make sure your firewall allows Moonraker API access from the ESP8266.
+- Find your Moonraker API Key: `http://{your-moonraker-host}/access/api_key`
 
 ---
 
 ## Credits
 
 - Original concept and code: [Robert W. Mech](https://www.makersmashup.com/)
-- Klipper/Moonraker adaptation: [Your Name/Contributors]
 
 ---
 
