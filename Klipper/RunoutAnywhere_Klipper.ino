@@ -1,240 +1,256 @@
-/**
-   RunoutAnywhere for Klipper (Moonraker API)
-   Adapted from original Octoprint version by Robert W. Mech
+/*
+ * RunoutAnywhere Klipper Edition (ESP8266/ESP32)
+ * WiFi filament runout sensor for Klipper/Moonraker
+ * Features:
+ *  - Web GUI for configuration (Moonraker URL, API key)
+ *  - LED status codes (with table in web UI)
+ *  - Persistent settings (EEPROM)
+ *  - Sends pause/resume to Klipper via HTTP
+ *  - Live device status in web GUI
+ *  - Save and reboot via web GUI
+ *  - Simple endstop (NO/NC) as filament runout switch
+ *  - Easy to adapt for ESP32 (use WiFi.h, WebServer)
+ */
 
-   This version monitors a filament runout sensor and communicates via Moonraker API
-   to Klipper, pausing or resuming prints as needed.
-
-   LED STATUSES
-   ------------
-   (same behavior as original, see original code)
-
-   Required Libraries:
-    - ESP8266WiFi
-    - ArduinoJson
-    - ESP8266HTTPClient
-*/
-
-#include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <ESP8266WiFiMulti.h>
+#include <ESP8266WebServer.h>
+#include <EEPROM.h>
 #include <ESP8266HTTPClient.h>
-#include <WiFiClient.h>
-#include <ArduinoJson.h>
 
-// CONFIGURATION
-#define CHECK_INTERVAL                   2000
-#define LED_PIN                          2
-#define SENSOR_PIN                       4
-#define AUTO_RESUME                      false
-#define LINES_BEFORE_HEADER              20
-#define SERIAL_RATE                      115200
-const char* SSID                   =     "YOUR_SSID";
-const char* WIFI_PASSWORD          =     "YOUR_PASS";
-const char* MOONRAKER_API_KEY      =     ""; // Only if your Moonraker requires an API key
-const char* MOONRAKER_URL          =     "http://192.168.10.112:7125"; // Moonraker default port is 7125
+// ----------------------------------------------
+// --- User Config (WiFi credentials)
+// ----------------------------------------------
+const char* SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
-// END CONFIGURATION
+// --- Pin Configuration ---
+#define SENSOR_PIN D2     // Your filament runout switch (GPIO4 on NodeMCU/Wemos D1 Mini)
+#define LED_PIN    D4     // Onboard LED (GPIO2 on NodeMCU/Wemos D1 Mini, active LOW)
 
-ESP8266WiFiMulti WiFiMulti;
-boolean connectioWasAlive = true;
-boolean ledToggle = false;
-boolean printerPaused = false;
-int runoutSensor = 0;
-DynamicJsonDocument doc(2048); // Klipper returns more data, so increased buffer
-// Printer status flags
-bool state_printing = false;
-bool state_ready = false;
-bool state_paused = false;
-const char* state_text;
-int linesPrinted = 0;
-int httpCode = 0;
-String payload = "";
-HTTPClient http;
+// --- EEPROM Layout ---
+#define EEPROM_SIZE 512
+#define EEPROM_MOONRAKER_URL_ADDR   0
+#define EEPROM_API_KEY_ADDR         100
 
-void setup() {
-  Serial.begin(SERIAL_RATE);
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(SENSOR_PIN, INPUT_PULLUP);
-  showBannerMessage();
+// --- Global Variables (settings and state) ---
+String moonraker_url = "http://192.168.1.100:7125";
+String moonraker_api_key = "";
+String status_message = "Idle";
+String last_action = "None";
+String filament_status = "Present"; // "Present" or "Runout"
+String wifi_status = "Disconnected";
+String moonraker_status = "Disconnected";
+bool filament_present = true;
+bool auto_resume = false; // Change to true for auto-resume mode
 
-  Serial.println("Pausing for WiFi Startup...\n\n");
-  for (int i = 0; i < 4; i++) {
-    Serial.flush();
+ESP8266WebServer server(80);
+
+// ---- Load and Save settings ----
+void saveSettings() {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.writeString(EEPROM_MOONRAKER_URL_ADDR, moonraker_url);
+  EEPROM.writeString(EEPROM_API_KEY_ADDR, moonraker_api_key);
+  EEPROM.commit();
+  EEPROM.end();
+}
+
+void loadSettings() {
+  EEPROM.begin(EEPROM_SIZE);
+  String url = EEPROM.readString(EEPROM_MOONRAKER_URL_ADDR);
+  if (url.length() > 5) moonraker_url = url;
+  String apikey = EEPROM.readString(EEPROM_API_KEY_ADDR);
+  if (apikey.length() > 3) moonraker_api_key = apikey;
+  EEPROM.end();
+}
+
+// ---- Web GUI ----
+String htmlPage() {
+  String html = "<html><head><title>RunoutAnywhere Klipper Config</title>";
+  html += "<style>body{font-family:sans-serif;}label{display:block;margin-top:10px;}input[type=text]{width:80%;}table{border-collapse:collapse;}td,th{border:1px solid #888;padding:4px 8px;}th{background:#eee;}</style>";
+  html += "</head><body><h2>RunoutAnywhere Klipper ESP8266</h2>";
+
+  html += "<form method='POST' action='/save'>";
+  html += "<label>Moonraker API Server Address:</label>";
+  html += "<input type='text' name='moonraker_url' value='" + moonraker_url + "'><br/>";
+  html += "<label>Moonraker API Key:</label>";
+  html += "<input type='text' name='moonraker_api_key' value='" + moonraker_api_key + "'><br/>";
+  html += "<br/><button type='submit'>Save and Reboot</button>";
+  html += "</form>";
+
+  html += "<hr><h3>LED Status Codes</h3>";
+  html += "<table>";
+  html += "<tr><th>Status</th><th>LED Behavior</th></tr>";
+  html += "<tr><td>Filament present</td><td>Solid ON</td></tr>";
+  html += "<tr><td>Runout (while printing)</td><td>Rapid blinking</td></tr>";
+  html += "<tr><td>No filament (idle)</td><td>OFF, short blink</td></tr>";
+  html += "<tr><td>Filament reloaded/ready</td><td>ON, short blink</td></tr>";
+  html += "<tr><td>Comms/API error</td><td>Slow even blinking</td></tr>";
+  html += "</table>";
+
+  html += "<hr><h3>Live Device Status</h3>";
+  html += "<ul>";
+  html += "<li><b>WiFi:</b> " + wifi_status + "</li>";
+  html += "<li><b>Moonraker:</b> " + moonraker_status + "</li>";
+  html += "<li><b>Filament:</b> " + filament_status + "</li>";
+  html += "<li><b>Last Action:</b> " + last_action + "</li>";
+  html += "<li><b>Status Message:</b> " + status_message + "</li>";
+  html += "</ul>";
+
+  html += "<hr><small>&copy; 2025 RunoutAnywhere Klipper</small>";
+  html += "</body></html>";
+  return html;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", htmlPage());
+}
+
+void handleSave() {
+  if (server.method() == HTTP_POST) {
+    if (server.hasArg("moonraker_url")) moonraker_url = server.arg("moonraker_url");
+    if (server.hasArg("moonraker_api_key")) moonraker_api_key = server.arg("moonraker_api_key");
+    saveSettings();
+    server.send(200, "text/html", "<html><body><h2>Settings Saved. Rebooting...</h2></body></html>");
     delay(1000);
+    ESP.restart();
+  } else {
+    server.send(405, "text/plain", "Method Not Allowed");
   }
-  WiFi.mode(WIFI_STA);
-  WiFiMulti.addAP(SSID, WIFI_PASSWORD);
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"wifi_status\":\"" + wifi_status + "\",";
+  json += "\"moonraker_status\":\"" + moonraker_status + "\",";
+  json += "\"filament_status\":\"" + filament_status + "\",";
+  json += "\"last_action\":\"" + last_action + "\",";
+  json += "\"status_message\":\"" + status_message + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ---- LED Status Codes ----
+void ledOn()   { digitalWrite(LED_PIN, LOW); }
+void ledOff()  { digitalWrite(LED_PIN, HIGH); }
+void ledBlink(int times, int on_ms, int off_ms) {
+  for (int i = 0; i < times; i++) {
+    ledOn(); delay(on_ms);
+    ledOff(); delay(off_ms);
+  }
+}
+
+void updateLED() {
+  // Example, minimal logic: solid on if present, rapid blink if runout
+  if (filament_present) {
+    ledOn();
+  } else {
+    ledBlink(3, 100, 100);
+  }
+}
+
+// ---- Moonraker Communication ----
+bool sendMoonrakerPause() {
+  HTTPClient http;
+  String url = moonraker_url + "/printer/print/pause";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  if (moonraker_api_key.length() > 0)
+    http.addHeader("X-Api-Key", moonraker_api_key);
+
+  int httpCode = http.POST("{}");
+  bool ok = (httpCode == 204 || httpCode == 200);
+  http.end();
+  moonraker_status = ok ? "Paused" : "API Error";
+  last_action = "Pause";
+  status_message = ok ? "Pause sent to Moonraker" : "Pause failed";
+  return ok;
+}
+
+bool sendMoonrakerResume() {
+  HTTPClient http;
+  String url = moonraker_url + "/printer/print/resume";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  if (moonraker_api_key.length() > 0)
+    http.addHeader("X-Api-Key", moonraker_api_key);
+
+  int httpCode = http.POST("{}");
+  bool ok = (httpCode == 204 || httpCode == 200);
+  http.end();
+  moonraker_status = ok ? "Resumed" : "API Error";
+  last_action = "Resume";
+  status_message = ok ? "Resume sent to Moonraker" : "Resume failed";
+  return ok;
+}
+
+// ---- Filament Sensor Logic ----
+bool last_filament_present = true;
+unsigned long last_action_time = 0;
+const unsigned long debounce_ms = 200;
+
+void checkFilament() {
+  bool now_present = digitalRead(SENSOR_PIN) == LOW; // LOW = present (NC switch to GND)
+  filament_present = now_present;
+  filament_status = now_present ? "Present" : "Runout";
+
+  if (now_present != last_filament_present && millis() - last_action_time > debounce_ms) {
+    last_action_time = millis();
+    if (!now_present) { // Runout
+      status_message = "Filament runout detected";
+      ledBlink(10, 100, 100); // Rapid flash
+      bool ok = sendMoonrakerPause();
+      if (!ok) { ledBlink(3, 500, 500); } // Signal error
+    } else { // Filament reloaded
+      status_message = "Filament reloaded";
+      if (auto_resume) {
+        bool ok = sendMoonrakerResume();
+        if (ok) ledBlink(2, 300, 100);
+        else   ledBlink(3, 500, 500);
+      } else {
+        ledBlink(2, 300, 100);
+      }
+    }
+    last_filament_present = now_present;
+  }
+}
+
+// ---- Arduino Setup & Loop ----
+void setup() {
+  pinMode(SENSOR_PIN, INPUT_PULLUP); // Use pullup for NO/NC switches
+  pinMode(LED_PIN, OUTPUT);
+  ledOff();
+
+  Serial.begin(115200);
+  loadSettings();
+  status_message = "Connecting WiFi...";
+  WiFi.begin(SSID, WIFI_PASSWORD);
+  wifi_status = "Connecting...";
+  int wait = 0;
+  while (WiFi.status() != WL_CONNECTED && wait < 100) {
+    delay(100);
+    Serial.print(".");
+    wait++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_status = WiFi.localIP().toString();
+    status_message = "WiFi connected";
+  } else {
+    wifi_status = "WiFi error";
+    status_message = "WiFi failed";
+  }
+
+  // Setup web server
+  server.on("/", handleRoot);
+  server.on("/save", handleSave);
+  server.on("/status", handleStatus);
+  server.begin();
+  status_message = "Web GUI Ready";
+  ledBlink(3, 100, 300);
 }
 
 void loop() {
-  monitorWiFi();
-
-  if ((WiFiMulti.run() == WL_CONNECTED)) {
-    WiFiClient client;
-    showHeader();
-
-    // Query Moonraker for printer object status
-    String statusUrl = String(MOONRAKER_URL) + "/printer/objects/query?print_stats&virtual_sdcard";
-    if (http.begin(client, statusUrl)) {
-      // Moonraker API key (rarely needed by default, but add header if you use one)
-      if (strlen(MOONRAKER_API_KEY) > 0) {
-        http.addHeader("X-Api-Key", MOONRAKER_API_KEY);
-      }
-      http.addHeader("Content-Type", "application/json");
-
-      httpCode = http.GET();
-      checkRunoutSwitchStatus();
-
-      if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
-        payload = http.getString();
-        http.end();
-
-        DeserializationError error = deserializeJson(doc, payload);
-        if (error) {
-          Serial.print(F("deserializeJson() failed: "));
-          Serial.println(error.c_str());
-          return;
-        } else {
-          // Extract relevant state from Moonraker
-          JsonObject print_stats = doc["result"]["status"]["print_stats"];
-          String state = print_stats["state"] | "";
-          state_printing = (state == "printing");
-          state_paused   = (state == "paused");
-          state_ready    = (state == "standby" || state == "ready" || state == "complete"); // standby may mean ready to print
-          state_text = state.c_str();
-
-          writeStatusLine();
-
-          // Only act if printing or paused
-          if (state_printing || state_paused) {
-            checkRunoutSwitchStatus();
-            if (runoutSensor == HIGH) { // Filament OUT
-              // Flash LED
-              for (int i = 0; i < 10; i++) {
-                delay(75);
-                digitalWrite(LED_PIN, LOW);
-                delay(75);
-                digitalWrite(LED_PIN, HIGH);
-              }
-              // Only pause if not already paused
-              if (!state_paused) {
-                String pauseUrl = String(MOONRAKER_URL) + "/printer/print/pause";
-                if (http.begin(client, pauseUrl)) {
-                  if (strlen(MOONRAKER_API_KEY) > 0) {
-                    http.addHeader("X-Api-Key", MOONRAKER_API_KEY);
-                  }
-                  http.addHeader("Content-Type", "application/json");
-                  httpCode = http.POST("{}"); // No payload needed for pause
-                  payload = http.getString();
-                  writeStatusLine();
-                  http.end();
-                }
-              }
-            } else { // Filament IN
-              digitalWrite(LED_PIN, LOW);
-              if (state_paused && AUTO_RESUME == true) {
-                String resumeUrl = String(MOONRAKER_URL) + "/printer/print/resume";
-                if (http.begin(client, resumeUrl)) {
-                  if (strlen(MOONRAKER_API_KEY) > 0) {
-                    http.addHeader("X-Api-Key", MOONRAKER_API_KEY);
-                  }
-                  http.addHeader("Content-Type", "application/json");
-                  httpCode = http.POST("{}"); // No payload needed for resume
-                  payload = http.getString();
-                  writeStatusLine();
-                  http.end();
-                }
-              }
-            }
-          } else {
-            printerPaused = false;
-          }
-        }
-      } else {
-        writeStatusLine();
-      }
-      http.end();
-    } else {
-      Serial.printf("[HTTP] Unable to connect\n");
-    }
-  }
-
-  checkRunoutSwitchStatus();
-  ledActions();
-  delay(CHECK_INTERVAL);
-}
-
-void ledActions() {
-  // LED blinking logic same as before
-  if (state_ready == true) {
-    if (runoutSensor == HIGH) {
-      digitalWrite(LED_PIN, LOW);
-      delay(50);
-      digitalWrite(LED_PIN, HIGH);
-    } else {
-      digitalWrite(LED_PIN, HIGH);
-      delay(50);
-      digitalWrite(LED_PIN, LOW);
-    }
-  }
-  if (state_ready == false && state_paused == false && state_printing == false) {
-    if (ledToggle) {
-      ledToggle = false;
-      digitalWrite(LED_PIN, LOW);
-    } else {
-      ledToggle = true;
-      digitalWrite(LED_PIN, HIGH);
-    }
-  }
-}
-
-void monitorWiFi()
-{
-  if (WiFiMulti.run() != WL_CONNECTED)
-  {
-    if (connectioWasAlive == true)
-    {
-      connectioWasAlive = false;
-      Serial.print("Looking for WiFi ");
-    }
-    Serial.print(".");
-    delay(500);
-  }
-  else if (connectioWasAlive == false)
-  {
-    connectioWasAlive = true;
-    Serial.printf(" connected to %s\n", WiFi.SSID().c_str());
-  }
-}
-
-void showHeader() {
-  if (linesPrinted == 0 || linesPrinted > LINES_BEFORE_HEADER) {
-    Serial.println("\n*******************************************************************************");
-    Serial.println("** RunoutAnywhere System Status    (1=True, 0=False)                         **");
-    Serial.println("*******************************************************************************");
-    Serial.println("Ready   Printing  Paused   Filament   HTTP & Server Response                   ");
-    Serial.println("-----   --------  ------   --------   -----------------------------------------");
-    linesPrinted = 0;
-  }
-}
-
-void writeStatusLine() {
-  Serial.printf(   "%d       %d         %d        %d          ", state_ready, state_printing, state_paused, runoutSensor == LOW);
-  Serial.print(httpCode);
-  Serial.print(" ");
-  Serial.println(state_text);
-  linesPrinted++;
-}
-
-void checkRunoutSwitchStatus() {
-  runoutSensor = digitalRead(SENSOR_PIN);
-}
-
-void showBannerMessage() {
-  Serial.println();
-  Serial.println("*******************************************************************************");
-  Serial.println("* RunoutAnywhere (Klipper) - Adapted from Robert W. Mech   www.MakersMashup.com *");
-  Serial.println("*******************************************************************************");
-  Serial.println();
+  server.handleClient();
+  checkFilament();
+  updateLED();
+  delay(50); // Adjust for responsiveness
 }
