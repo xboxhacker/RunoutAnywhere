@@ -5,7 +5,7 @@
  *  - Web GUI for configuration (Moonraker URL, API key)
  *  - LED status codes (with table in web UI)
  *  - Persistent settings (EEPROM)
- *  - Sends pause/resume to Klipper via HTTP
+ *  - Sends M600 to Klipper via HTTP on runout
  *  - Live device status in web GUI
  *  - Save and reboot via web GUI
  *  - Simple endstop (NO/NC) as filament runout switch
@@ -66,7 +66,7 @@ void loadSettings() {
 // ---- Web GUI ----
 String htmlPage() {
   String html = "<html><head><title>RunoutAnywhere Klipper Config</title>";
-  html += "<style>body{font-family:sans-serif;}label{display:block;margin-top:10px;}input[type=text]{width:80%;}table{border-collapse:collapse;}td,th{border:1px solid #888;padding:4px 8px;}th{background:#eee;}</style>";
+  html += "<style>body{font-family:sans-serif;}label{display:block;margin-top:10px;}input[type=text]{width:80%;}table{border-collapse:collapse;}td,th{border:1px solid #888;padding:4px 8px;}th{background:#ccc;}</style>";
   html += "</head><body><h2>RunoutAnywhere Klipper ESP8266</h2>";
 
   html += "<form method='POST' action='/save'>";
@@ -166,6 +166,24 @@ bool sendMoonrakerPause() {
   return ok;
 }
 
+// ---- Send M600 G-code to Moonraker ----
+bool sendMoonrakerM600() {
+  HTTPClient http;
+  String url = moonraker_url + "/printer/gcode/script";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  if (moonraker_api_key.length() > 0)
+    http.addHeader("X-Api-Key", moonraker_api_key);
+
+  int httpCode = http.POST("{\"script\":\"M600\"}");
+  bool ok = (httpCode == 204 || httpCode == 200);
+  http.end();
+  moonraker_status = ok ? "M600 Sent" : "API Error";
+  last_action = "M600";
+  status_message = ok ? "M600 sent to Moonraker" : "M600 failed";
+  return ok;
+}
+
 bool sendMoonrakerResume() {
   HTTPClient http;
   String url = moonraker_url + "/printer/print/resume";
@@ -198,7 +216,7 @@ void checkFilament() {
     if (!now_present) { // Runout
       status_message = "Filament runout detected";
       ledBlink(10, 100, 100); // Rapid flash
-      bool ok = sendMoonrakerPause();
+      bool ok = sendMoonrakerM600(); // <--- Send M600 instead of pause
       if (!ok) { ledBlink(3, 500, 500); } // Signal error
     } else { // Filament reloaded
       status_message = "Filament reloaded";
