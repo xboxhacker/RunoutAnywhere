@@ -1,6 +1,5 @@
 # RunoutAnywhere Klipper Edition (ESP8266/ESP32)
 
-**WiFi Filament Runout Sensor for Klipper/Moonraker**
 
 WiFi filament runout sensor for Klipper/Moonraker, now with support for sending the `M600` G-code command on filament runout. The M600 command allows you to use Klipper's macro handling for filament change events, giving you full control of the printer's behavior after runout.
 
