@@ -119,9 +119,5 @@ gcode:
 - All status and actions are visible in the Web GUI.
 - For ESP32, use `WiFi.h` and `WebServer` (see comments in `.ino`).
 
----
 
-## License
-
-&copy; 2025 RunoutAnywhere Klipper
 
