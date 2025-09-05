@@ -1,8 +1,9 @@
 /*
  * RunoutAnywhere Klipper Edition (ESP8266/ESP32)
+ * Version: 1.2.1
  * WiFi filament runout sensor for Klipper/Moonraker
  * Features:
- *  - Web GUI for configuration (Moonraker URL, API key)
+ *  - Web GUI for configuration (Moonraker URL, API key, local hostname)
  *  - LED status codes (with table in web UI)
  *  - Persistent settings (EEPROM)
  *  - Sends M600 to Klipper via HTTP on runout
@@ -10,12 +11,17 @@
  *  - Save and reboot via web GUI
  *  - Simple endstop (NO/NC) as filament runout switch
  *  - Easy to adapt for ESP32 (use WiFi.h, WebServer)
+ *  - Optionally sets a local mDNS hostname for access via http://hostname.local/
  */
 
+#define RUNOUTANYWHERE_VERSION "1.2.1"
+
+#include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266mDNS.h>
 
 // ----------------------------------------------
 // --- User Config (WiFi credentials)
@@ -24,13 +30,15 @@ const char* SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 // --- Pin Configuration ---
-#define SENSOR_PIN D2     // Your filament runout switch (GPIO4 on NodeMCU/Wemos D1 Mini)
-#define LED_PIN    D4     // Onboard LED (GPIO2 on NodeMCU/Wemos D1 Mini, active LOW)
+#define SENSOR_PIN 4     // D2 = GPIO4 on NodeMCU/Wemos D1 Mini
+#define LED_PIN    2     // D4 = GPIO2 on NodeMCU/Wemos D1 Mini, active LOW
 
 // --- EEPROM Layout ---
 #define EEPROM_SIZE 512
 #define EEPROM_MOONRAKER_URL_ADDR   0
 #define EEPROM_API_KEY_ADDR         100
+#define EEPROM_HOSTNAME_ADDR        200
+#define EEPROM_STRING_SIZE          64     // max length for stored strings
 
 // --- Global Variables (settings and state) ---
 String moonraker_url = "http://192.168.1.100:7125";
@@ -42,25 +50,51 @@ String wifi_status = "Disconnected";
 String moonraker_status = "Disconnected";
 bool filament_present = true;
 bool auto_resume = false; // Change to true for auto-resume mode
+String local_hostname = "runoutanywhere"; // Default mDNS hostname
 
 ESP8266WebServer server(80);
 
-// ---- Load and Save settings ----
-void saveSettings() {
+// ---- EEPROM String Helpers ----
+void EEPROM_writeString(int addr, const String &data) {
   EEPROM.begin(EEPROM_SIZE);
-  EEPROM.writeString(EEPROM_MOONRAKER_URL_ADDR, moonraker_url);
-  EEPROM.writeString(EEPROM_API_KEY_ADDR, moonraker_api_key);
+  int len = data.length();
+  if (len > EEPROM_STRING_SIZE - 1) len = EEPROM_STRING_SIZE - 1;
+  for (int i = 0; i < len; i++) {
+    EEPROM.write(addr + i, data[i]);
+  }
+  EEPROM.write(addr + len, 0); // null-terminate
   EEPROM.commit();
   EEPROM.end();
 }
 
-void loadSettings() {
+String EEPROM_readString(int addr) {
   EEPROM.begin(EEPROM_SIZE);
-  String url = EEPROM.readString(EEPROM_MOONRAKER_URL_ADDR);
-  if (url.length() > 5) moonraker_url = url;
-  String apikey = EEPROM.readString(EEPROM_API_KEY_ADDR);
-  if (apikey.length() > 3) moonraker_api_key = apikey;
+  char data[EEPROM_STRING_SIZE];
+  int i = 0;
+  while (i < EEPROM_STRING_SIZE - 1) {
+    byte b = EEPROM.read(addr + i);
+    if (b == 0) break;
+    data[i++] = b;
+  }
+  data[i] = 0;
   EEPROM.end();
+  return String(data);
+}
+
+// ---- Load and Save settings ----
+void saveSettings() {
+  EEPROM_writeString(EEPROM_MOONRAKER_URL_ADDR, moonraker_url);
+  EEPROM_writeString(EEPROM_API_KEY_ADDR, moonraker_api_key);
+  EEPROM_writeString(EEPROM_HOSTNAME_ADDR, local_hostname);
+}
+
+void loadSettings() {
+  String url = EEPROM_readString(EEPROM_MOONRAKER_URL_ADDR);
+  if (url.length() > 5) moonraker_url = url;
+  String apikey = EEPROM_readString(EEPROM_API_KEY_ADDR);
+  if (apikey.length() > 3) moonraker_api_key = apikey;
+  String hostname = EEPROM_readString(EEPROM_HOSTNAME_ADDR);
+  if (hostname.length() > 2) local_hostname = hostname;
 }
 
 // ---- Web GUI ----
@@ -68,14 +102,24 @@ String htmlPage() {
   String html = "<html><head><title>RunoutAnywhere Klipper Config</title>";
   html += "<style>body{font-family:sans-serif;}label{display:block;margin-top:10px;}input[type=text]{width:80%;}table{border-collapse:collapse;}td,th{border:1px solid #888;padding:4px 8px;}th{background:#ccc;}</style>";
   html += "</head><body><h2>RunoutAnywhere Klipper ESP8266</h2>";
+  html += "<div><b>Firmware Version: " + String(RUNOUTANYWHERE_VERSION) + "</b></div>";
 
   html += "<form method='POST' action='/save'>";
   html += "<label>Moonraker API Server Address:</label>";
   html += "<input type='text' name='moonraker_url' value='" + moonraker_url + "'><br/>";
   html += "<label>Moonraker API Key:</label>";
   html += "<input type='text' name='moonraker_api_key' value='" + moonraker_api_key + "'><br/>";
+  html += "<label>Local Hostname (.local access, mDNS):</label>";
+  html += "<input type='text' name='local_hostname' value='" + local_hostname + "'><br/>";
+  html += "<small>Access this device via http://" + local_hostname + ".local/ (on most OS with mDNS/Bonjour)</small><br/>";
   html += "<br/><button type='submit'>Save and Reboot</button>";
   html += "</form>";
+
+  html += "<hr><h3>Connection Info</h3>";
+  html += "<ul>";
+  html += "<li><b>Device IP Address:</b> " + wifi_status + "</li>";
+  html += "<li><b>Device Hostname:</b> " + local_hostname + ".local</li>";
+  html += "</ul>";
 
   html += "<hr><h3>LED Status Codes</h3>";
   html += "<table>";
@@ -109,6 +153,7 @@ void handleSave() {
   if (server.method() == HTTP_POST) {
     if (server.hasArg("moonraker_url")) moonraker_url = server.arg("moonraker_url");
     if (server.hasArg("moonraker_api_key")) moonraker_api_key = server.arg("moonraker_api_key");
+    if (server.hasArg("local_hostname")) local_hostname = server.arg("local_hostname");
     saveSettings();
     server.send(200, "text/html", "<html><body><h2>Settings Saved. Rebooting...</h2></body></html>");
     delay(1000);
@@ -124,7 +169,9 @@ void handleStatus() {
   json += "\"moonraker_status\":\"" + moonraker_status + "\",";
   json += "\"filament_status\":\"" + filament_status + "\",";
   json += "\"last_action\":\"" + last_action + "\",";
-  json += "\"status_message\":\"" + status_message + "\"";
+  json += "\"status_message\":\"" + status_message + "\",";
+  json += "\"local_hostname\":\"" + local_hostname + "\",";
+  json += "\"version\":\"" + String(RUNOUTANYWHERE_VERSION) + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -149,28 +196,11 @@ void updateLED() {
 }
 
 // ---- Moonraker Communication ----
-bool sendMoonrakerPause() {
-  HTTPClient http;
-  String url = moonraker_url + "/printer/print/pause";
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  if (moonraker_api_key.length() > 0)
-    http.addHeader("X-Api-Key", moonraker_api_key);
-
-  int httpCode = http.POST("{}");
-  bool ok = (httpCode == 204 || httpCode == 200);
-  http.end();
-  moonraker_status = ok ? "Paused" : "API Error";
-  last_action = "Pause";
-  status_message = ok ? "Pause sent to Moonraker" : "Pause failed";
-  return ok;
-}
-
-// ---- Send M600 G-code to Moonraker ----
 bool sendMoonrakerM600() {
+  WiFiClient client;
   HTTPClient http;
   String url = moonraker_url + "/printer/gcode/script";
-  http.begin(url);
+  http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
   if (moonraker_api_key.length() > 0)
     http.addHeader("X-Api-Key", moonraker_api_key);
@@ -185,9 +215,10 @@ bool sendMoonrakerM600() {
 }
 
 bool sendMoonrakerResume() {
+  WiFiClient client;
   HTTPClient http;
   String url = moonraker_url + "/printer/print/resume";
-  http.begin(url);
+  http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
   if (moonraker_api_key.length() > 0)
     http.addHeader("X-Api-Key", moonraker_api_key);
@@ -216,7 +247,7 @@ void checkFilament() {
     if (!now_present) { // Runout
       status_message = "Filament runout detected";
       ledBlink(10, 100, 100); // Rapid flash
-      bool ok = sendMoonrakerM600(); // <--- Send M600 instead of pause
+      bool ok = sendMoonrakerM600(); // Send M600 instead of pause
       if (!ok) { ledBlink(3, 500, 500); } // Signal error
     } else { // Filament reloaded
       status_message = "Filament reloaded";
@@ -252,6 +283,12 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     wifi_status = WiFi.localIP().toString();
     status_message = "WiFi connected";
+    // Setup mDNS hostname
+    if (MDNS.begin(local_hostname.c_str())) {
+      status_message += " | mDNS active: http://" + local_hostname + ".local/";
+    } else {
+      status_message += " | mDNS failed";
+    }
   } else {
     wifi_status = "WiFi error";
     status_message = "WiFi failed";
@@ -270,5 +307,6 @@ void loop() {
   server.handleClient();
   checkFilament();
   updateLED();
+  MDNS.update();
   delay(50); // Adjust for responsiveness
 }
